@@ -155,6 +155,8 @@ pub struct Config {
     ///
     /// If not set, the `cluster_url` is used instead
     pub tls_server_name: Option<String>,
+    /// Cluster information
+    pub cluster: Cluster,
 }
 
 impl Config {
@@ -175,6 +177,7 @@ impl Config {
             auth_info: AuthInfo::default(),
             proxy_url: None,
             tls_server_name: None,
+            cluster: Cluster::default(),
         }
     }
 
@@ -257,6 +260,8 @@ impl Config {
             },
             proxy_url: None,
             tls_server_name: None,
+            // not used tbh, maybe do something else?
+            cluster: Cluster::default(),
         })
     }
 
@@ -303,6 +308,7 @@ impl Config {
             root_cert = Some(ca_bundle);
         }
 
+        let cluster = loader.cluster.clone();
         Ok(Self {
             cluster_url,
             default_namespace,
@@ -314,6 +320,7 @@ impl Config {
             proxy_url: loader.proxy_url()?,
             auth_info: loader.user,
             tls_server_name: loader.cluster.tls_server_name,
+            cluster,
         })
     }
 

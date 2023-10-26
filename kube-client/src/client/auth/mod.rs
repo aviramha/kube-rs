@@ -19,11 +19,16 @@ use tower::{filter::AsyncPredicate, BoxError};
 
 use crate::config::{AuthInfo, AuthProviderConfig, ExecConfig, ExecInteractiveMode};
 
-#[cfg(feature = "oauth")] mod oauth;
-#[cfg(feature = "oauth")] pub use oauth::Error as OAuthError;
-#[cfg(feature = "oidc")] mod oidc;
-#[cfg(feature = "oidc")] pub use oidc::errors as oidc_errors;
-#[cfg(target_os = "windows")] use std::os::windows::process::CommandExt;
+#[cfg(feature = "oauth")]
+mod oauth;
+#[cfg(feature = "oauth")]
+pub use oauth::Error as OAuthError;
+#[cfg(feature = "oidc")]
+mod oidc;
+#[cfg(feature = "oidc")]
+pub use oidc::errors as oidc_errors;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 #[derive(Error, Debug)]
 /// Client auth errors
@@ -167,7 +172,7 @@ impl TokenFile {
 // It's not accessible from outside and not shown on docs.
 #[derive(Debug, Clone)]
 pub enum RefreshableToken {
-    Exec(Arc<Mutex<(SecretString, DateTime<Utc>, AuthInfo)>>),
+    Exec(Arc<Mutex<(SecretString, DateTime<Utc>, AuthInfo, Option<Cluster>)>>),
     File(Arc<RwLock<TokenFile>>),
     #[cfg(feature = "oauth")]
     GcpOauth(Arc<Mutex<oauth::Gcp>>),
@@ -203,18 +208,19 @@ impl RefreshableToken {
                 // conditions where the token expires while we are refreshing
                 if Utc::now() + Duration::seconds(60) >= locked_data.1 {
                     // TODO Improve refreshing exec to avoid `Auth::try_from`
-                    match Auth::try_from(&locked_data.2)? {
+                    match auth(&locked_data.2, locked_data.3.clone())? {
                         Auth::None | Auth::Basic(_, _) | Auth::Bearer(_) | Auth::Certificate(_, _) => {
                             return Err(Error::UnrefreshableTokenResponse);
                         }
 
                         Auth::RefreshableToken(RefreshableToken::Exec(d)) => {
-                            let (new_token, new_expire, new_info) = Arc::try_unwrap(d)
+                            let (new_token, new_expire, new_info, new_cluster) = Arc::try_unwrap(d)
                                 .expect("Unable to unwrap Arc, this is likely a programming error")
                                 .into_inner();
                             locked_data.0 = new_token;
                             locked_data.1 = new_expire;
                             locked_data.2 = new_info;
+                            locked_data.3 = new_cluster;
                         }
 
                         // Unreachable because the token source does not change
@@ -263,90 +269,93 @@ fn bearer_header(token: &str) -> Result<HeaderValue, Error> {
     Ok(value)
 }
 
-impl TryFrom<&AuthInfo> for Auth {
-    type Error = Error;
+/// Loads the authentication header from the credentials available in the kubeconfig. This supports
+/// exec plugins as well as specified in
+/// https://kubernetes.io/docs/reference/access-authn-authz/authentication/#client-go-credential-plugins
+pub fn auth<C: Into<Cluster>>(auth_info: &AuthInfo, cluster: Option<C>) -> Result<Auth, Error> {
+    if let Some(provider) = &auth_info.auth_provider {
+        match token_from_provider(provider)? {
+            #[cfg(feature = "oidc")]
+            ProviderToken::Oidc(oidc) => {
+                return Ok(Auth::RefreshableToken(RefreshableToken::Oidc(Arc::new(
+                    Mutex::new(oidc),
+                ))));
+            }
 
-    /// Loads the authentication header from the credentials available in the kubeconfig. This supports
-    /// exec plugins as well as specified in
-    /// https://kubernetes.io/docs/reference/access-authn-authz/authentication/#client-go-credential-plugins
-    fn try_from(auth_info: &AuthInfo) -> Result<Self, Self::Error> {
-        if let Some(provider) = &auth_info.auth_provider {
-            match token_from_provider(provider)? {
-                #[cfg(feature = "oidc")]
-                ProviderToken::Oidc(oidc) => {
-                    return Ok(Self::RefreshableToken(RefreshableToken::Oidc(Arc::new(
-                        Mutex::new(oidc),
-                    ))));
-                }
+            #[cfg(not(feature = "oidc"))]
+            ProviderToken::Oidc(token) => {
+                return Ok(Auth::Bearer(SecretString::from(token)));
+            }
 
-                #[cfg(not(feature = "oidc"))]
-                ProviderToken::Oidc(token) => {
-                    return Ok(Self::Bearer(SecretString::from(token)));
-                }
+            ProviderToken::GcpCommand(token, Some(expiry)) => {
+                let mut info = auth_info.clone();
+                let mut provider = provider.clone();
+                provider.config.insert("access-token".into(), token.clone());
+                provider.config.insert("expiry".into(), expiry.to_rfc3339());
+                info.auth_provider = Some(provider);
+                return Ok(Auth::RefreshableToken(RefreshableToken::Exec(Arc::new(
+                    Mutex::new((SecretString::from(token), expiry, info, None)),
+                ))));
+            }
 
-                ProviderToken::GcpCommand(token, Some(expiry)) => {
-                    let mut info = auth_info.clone();
-                    let mut provider = provider.clone();
-                    provider.config.insert("access-token".into(), token.clone());
-                    provider.config.insert("expiry".into(), expiry.to_rfc3339());
-                    info.auth_provider = Some(provider);
-                    return Ok(Self::RefreshableToken(RefreshableToken::Exec(Arc::new(
-                        Mutex::new((SecretString::from(token), expiry, info)),
-                    ))));
-                }
+            ProviderToken::GcpCommand(token, None) => {
+                return Ok(Auth::Bearer(SecretString::from(token)));
+            }
 
-                ProviderToken::GcpCommand(token, None) => {
-                    return Ok(Self::Bearer(SecretString::from(token)));
-                }
-
-                #[cfg(feature = "oauth")]
-                ProviderToken::GcpOauth(gcp) => {
-                    return Ok(Self::RefreshableToken(RefreshableToken::GcpOauth(Arc::new(
-                        Mutex::new(gcp),
-                    ))));
-                }
+            #[cfg(feature = "oauth")]
+            ProviderToken::GcpOauth(gcp) => {
+                return Ok(Auth::RefreshableToken(RefreshableToken::GcpOauth(Arc::new(
+                    Mutex::new(gcp),
+                ))));
             }
         }
+    }
 
-        if let (Some(u), Some(p)) = (&auth_info.username, &auth_info.password) {
-            return Ok(Self::Basic(u.to_owned(), p.to_owned()));
-        }
+    if let (Some(u), Some(p)) = (&auth_info.username, &auth_info.password) {
+        return Ok(Auth::Basic(u.to_owned(), p.to_owned()));
+    }
 
-        // Inline token. Has precedence over `token_file`.
-        if let Some(token) = &auth_info.token {
-            return Ok(Self::Bearer(token.clone()));
-        }
+    // Inline token. Has precedence over `token_file`.
+    if let Some(token) = &auth_info.token {
+        return Ok(Auth::Bearer(token.clone()));
+    }
 
-        // Token file reference. Must be reloaded at least once a minute.
-        if let Some(file) = &auth_info.token_file {
-            return Ok(Self::RefreshableToken(RefreshableToken::File(Arc::new(
-                RwLock::new(TokenFile::new(file)?),
-            ))));
-        }
+    // Token file reference. Must be reloaded at least once a minute.
+    if let Some(file) = &auth_info.token_file {
+        return Ok(Auth::RefreshableToken(RefreshableToken::File(Arc::new(
+            RwLock::new(TokenFile::new(file)?),
+        ))));
+    }
 
-        if let Some(exec) = &auth_info.exec {
-            let creds = auth_exec(exec)?;
-            let status = creds.status.ok_or(Error::ExecPluginFailed)?;
-            if let (Some(client_certificate_data), Some(client_key_data)) =
-                (status.client_certificate_data, status.client_key_data)
-            {
-                return Ok(Self::Certificate(client_certificate_data, client_key_data.into()));
+    if let Some(exec) = &auth_info.exec {
+        let cluster: Option<Cluster> = {
+            if exec.provide_cluster_info {
+                Some(cluster.map(Into::into).ok_or_else(|| Error::AuthExec("Cluster info not available".into()))?)
+            } else {
+                None
             }
-            let expiration = status
-                .expiration_timestamp
-                .map(|ts| ts.parse())
-                .transpose()
-                .map_err(Error::MalformedTokenExpirationDate)?;
-            match (status.token.map(SecretString::from), expiration) {
-                (Some(token), Some(expire)) => Ok(Self::RefreshableToken(RefreshableToken::Exec(Arc::new(
-                    Mutex::new((token, expire, auth_info.clone())),
-                )))),
-                (Some(token), None) => Ok(Self::Bearer(token)),
-                _ => Ok(Self::None),
-            }
-        } else {
-            Ok(Self::None)
+        };
+        let creds = auth_exec(exec, cluster)?;
+        let status = creds.status.ok_or(Error::ExecPluginFailed)?;
+        if let (Some(client_certificate_data), Some(client_key_data)) =
+            (status.client_certificate_data, status.client_key_data)
+        {
+            return Ok(Auth::Certificate(client_certificate_data, client_key_data.into()));
         }
+        let expiration = status
+            .expiration_timestamp
+            .map(|ts| ts.parse())
+            .transpose()
+            .map_err(Error::MalformedTokenExpirationDate)?;
+        match (status.token.map(SecretString::from), expiration) {
+            (Some(token), Some(expire)) => Ok(Auth::RefreshableToken(RefreshableToken::Exec(Arc::new(
+                Mutex::new((token, expire, auth_info.clone(), cluster)),
+            )))),
+            (Some(token), None) => Ok(Auth::Bearer(token)),
+            _ => Ok(Auth::None),
+        }
+    } else {
+        Ok(Auth::None)
     }
 }
 
@@ -505,12 +514,45 @@ pub struct ExecCredential {
     pub status: Option<ExecCredentialStatus>,
 }
 
+/// Cluster stores information to connect Kubernetes cluster.
+/// This is a copy of [`kube::config::Cluster`] with certificate_authority passed as bytes without the path.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub struct Cluster {
+    /// The address of the kubernetes cluster (https://hostname:port).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// Skips the validity check for the server's certificate. This will make your HTTPS connections insecure.
+    #[serde(rename = "insecure-skip-tls-verify")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insecure_skip_tls_verify: Option<bool>,
+    /// PEM-encoded certificate authority certificates. Overrides `certificate_authority`
+    #[serde(rename = "certificate-authority-data")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_authority_data: Option<String>,
+    /// URL to the proxy to be used for all requests.
+    #[serde(rename = "proxy-url")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// Name used to check server certificate.
+    ///
+    /// If `tls_server_name` is `None`, the hostname used to contact the server is used.
+    #[serde(rename = "tls-server-name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_server_name: Option<String>,
+    /// This can be anything
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+}
+
 /// ExecCredenitalSpec holds request and runtime specific information provided
 /// by transport.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecCredentialSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     interactive: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster: Option<Cluster>,
 }
 
 /// ExecCredentialStatus holds credentials for the transport to use.
@@ -525,7 +567,9 @@ pub struct ExecCredentialStatus {
     pub client_key_data: Option<String>,
 }
 
-fn auth_exec(auth: &ExecConfig) -> Result<ExecCredential, Error> {
+/// Prepares the auth exec command
+/// if cluster is provided, it means it needs to be passed.
+fn auth_exec(auth: &ExecConfig, cluster: Option<Cluster>) -> Result<ExecCredential, Error> {
     let mut cmd = match &auth.command {
         Some(cmd) => Command::new(cmd),
         None => return Err(Error::MissingCommand),
@@ -551,13 +595,18 @@ fn auth_exec(auth: &ExecConfig) -> Result<ExecCredential, Error> {
         cmd.stdin(std::process::Stdio::piped());
     }
 
+    let mut exec_spec = ExecCredentialSpec {
+        interactive: Some(interactive),
+        cluster: None,
+    };
+    if auth.provide_cluster_info {
+        exec_spec.cluster = cluster
+    }
     // Provide exec info to child process
-    let exec_info = serde_json::to_string(&ExecCredential {
+    let mut exec_info = serde_json::to_string(&ExecCredential {
         api_version: auth.api_version.clone(),
         kind: "ExecCredential".to_string().into(),
-        spec: Some(ExecCredentialSpec {
-            interactive: Some(interactive),
-        }),
+        spec: Some(exec_spec),
         status: None,
     })
     .map_err(Error::AuthExecSerialize)?;

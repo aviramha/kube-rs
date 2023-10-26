@@ -278,6 +278,13 @@ pub struct ExecConfig {
     #[serde(rename = "interactiveMode")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interactive_mode: Option<ExecInteractiveMode>,
+
+    // ProvideClusterInfo determines whether or not to provide cluster information,
+	// which could potentially contain very large CA data, to this exec plugin as a
+	// part of the KUBERNETES_EXEC_INFO environment variable. By default, it is set
+	// to false.
+    #[serde(default, rename = "provideClusterInfo")]
+    pub provide_cluster_info: bool
 }
 
 /// ExecInteractiveMode define the interactity of the child process
